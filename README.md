@@ -18,7 +18,7 @@ This one-line installer downloads the current script from GitHub and opens the t
 toolbox=$(mktemp /tmp/singbox-toolbox.XXXXXXXX) && curl -qfsSL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/aboutnima/ubuntu-vless/main/singbox-toolbox.sh -o "$toolbox" && sudo --preserve-env=SSH_CONNECTION bash "$toolbox"
 ```
 
-Use the arrow keys to move, Enter to select, `R` to refresh service status, and Esc to go back. The dashboard shows the service, routing mode, and staged profile. During a pending TUN activation it shows the time remaining before rollback. Use `menu --plain` for the numbered fallback.
+Use the arrow keys to move, Enter to select, `R` to refresh service status, and Esc to go back. The dashboard shows the service, routing mode, and staged profile. Each action opens a clean output view inside the terminal UI. Use Up/Down or Page Up/Page Down to scroll longer output and Enter or Esc to return. During a pending TUN activation the dashboard shows the time remaining before rollback. Use `menu --plain` for the numbered fallback.
 
 To keep a short command on the server after downloading `singbox-toolbox.sh`:
 

@@ -53,6 +53,18 @@ run_action() {
                 return 1
             fi
             ;;
+        logs)
+            printf '%s\n' 'First journal entry'
+            sleep 1.2
+            for value in {2..20}; do
+                printf 'Journal entry %s\n' "$value"
+            done
+            printf '\033[?1049l%s\n' 'Last journal entry'
+            ;;
+        test)
+            printf '%s\n' 'Fixture connectivity failed.' >&2
+            return 42
+            ;;
     esac
     printf '%s\n' 'Fixture action finished.'
 }
@@ -190,7 +202,8 @@ TITLE = b"UBUNTU VLESS"
 VLESS_LABEL = b"Import VLESS link"
 VLESS_PROMPT = b"VLESS URL (hidden): "
 VLESS_TOKEN = b"vless://dummy-keyboard-test@vpn.example.test:443"
-RETURN_PROMPT = b"Press Enter to return to the toolbox."
+RETURN_PROMPT = b"Enter/Esc Back"
+ALT_SCREEN_EXIT = b"\x1b[?1049l"
 JSON_URL = b"https://vpn.example.test/profile.json?token=keyboard-test-dummy"
 
 
@@ -204,6 +217,7 @@ def credential_case(toolbox, bash, tmp):
         progress = tty.expect(b"Fixture action finished.", start=begin)
         prompt = tty.expect(RETURN_PROMPT, start=progress)
         tty.expect_actions("import-vless -", "vless-input-ok")
+        assert ALT_SCREEN_EXIT not in tty.transcript, "The action left the dashboard"
         assert VLESS_TOKEN not in tty.transcript, "The credential was echoed to the terminal"
         tty.send(b"\r")
         tty.expect(TITLE, start=prompt)
@@ -254,6 +268,32 @@ def resize_case(toolbox, bash, tmp):
         tty.assert_exit()
 
 
+def output_case(toolbox, bash, tmp):
+    with Terminal(toolbox, bash, tmp, rows=18, cols=88) as tty:
+        tty.expect(b"ACTIONS")
+        tty.send(b"jjjjjjjj\r")
+        running = tty.expect(b"Running...")
+        tty.expect(b"First journal entry", start=running)
+        review = tty.expect(RETURN_PROMPT, start=running)
+        assert b"Last journal entry" in tty.transcript[running:review]
+        assert ALT_SCREEN_EXIT not in tty.transcript, "Command output escaped the alternate screen"
+        tty.send(b"\x1b[5~")
+        scrolled = tty.expect(b"First journal entry", start=review)
+        tty.send(b"\r")
+        dashboard = tty.expect(b"ACTIONS", start=scrolled)
+        tty.send(b"kkk\r")
+        failed = tty.expect(b"Failed (exit 42)", start=dashboard)
+        review = tty.expect(RETURN_PROMPT, start=failed)
+        assert b"Fixture connectivity failed." in tty.transcript[failed:review]
+        assert b"journal entry" not in tty.transcript[failed:review].lower()
+        tty.expect_actions("logs", "test")
+        tty.send(b"\x1b")
+        tty.expect(b"ACTIONS", start=review)
+        assert not list(tmp.glob("ui-output.*")), "An action output file was left behind"
+        tty.send(b"q")
+        tty.assert_exit()
+
+
 def term_case(toolbox, bash, tmp):
     with Terminal(toolbox, bash, tmp) as tty:
         tty.expect(VLESS_LABEL)
@@ -289,6 +329,7 @@ def run_cases(toolbox, bash):
         (credential_case, "arrow navigation, hidden credential, and Escape exit"),
         (json_case, "JSON source dialog, Escape back, and hidden HTTPS URL"),
         (resize_case, "resize, short-window scrolling, and log dispatch"),
+        (output_case, "live output, scrolling, fresh action results, and safe terminal rendering"),
         (term_case, "terminal restoration after SIGTERM"),
         (plain_case, "plain menu fallback on a dumb terminal"),
         (cli_case, "non-interactive status bypasses the dashboard"),

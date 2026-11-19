@@ -2087,8 +2087,12 @@ TUI_HEIGHT=24
 TUI_ACCENT=
 TUI_MUTED=
 TUI_FOCUS=$'\033[7m'
+TUI_OUTPUT=
+TUI_PROGRESS_PID=
 
 tui_cleanup() {
+    tui_stop_progress
+    tui_remove_output
     if [[ $TUI_ACTIVE == yes ]]; then
         TUI_ACTIVE=no
         printf '\033[0m\033[?25h\033[?1049l' || true
@@ -2256,6 +2260,10 @@ tui_key() {
                     B) TUI_KEY=down ;;
                     H) TUI_KEY=first ;;
                     F) TUI_KEY=last ;;
+                    5|6)
+                        if IFS= read -rsn1 -t .18 escaped && [[ $escaped == '~' ]]; then
+                            if [[ $ending == 5 ]]; then TUI_KEY=page-up; else TUI_KEY=page-down; fi
+                        fi ;;
                 esac
             fi ;;
         *)
@@ -2305,25 +2313,153 @@ tui_prompt() {
     printf '\033[6;1H  '
 }
 
-menu_run() {
-    local ui=$1 title=$2 action=$3 result=0
-    shift 3
-    if [[ $ui == terminal ]]; then
-        tui_cleanup
-        printf '\n%s\n\n' "$title"
+tui_stop_progress() {
+    if [[ -n $TUI_PROGRESS_PID ]]; then
+        kill "$TUI_PROGRESS_PID" 2>/dev/null || true
+        wait "$TUI_PROGRESS_PID" 2>/dev/null || true
+        TUI_PROGRESS_PID=
     fi
-    if [[ $action == import-vless || ( $action == import-json && ${1:-} == --url-stdin ) ]]; then
-        run_action "$action" "$@" <&3 3<&- || result=$?
-    else
-        run_action "$action" "$@" || result=$?
+}
+
+tui_remove_output() {
+    if [[ -n $TUI_OUTPUT ]]; then
+        rm -f -- "$TUI_OUTPUT"
+        TUI_OUTPUT=
     fi
-    if [[ $ui == terminal ]]; then
-        if ((result != 0)); then
-            printf '\n%s\n' 'Action failed. See the output above.'
+}
+
+tui_render_output() {
+    local title=$1 status=$2 top=$3 first=5 last index count style
+    local -a lines
+    tui_measure
+    # Command output is data. Strip terminal controls before displaying it.
+    mapfile -t lines < <(
+        LC_ALL=C sed -E $'s/\033\\[[0-?]*[ -/]*[@-~]//g' "$TUI_OUTPUT" |
+            LC_ALL=C tr -cd '\11\12\40-\176' |
+            expand -t 4 | fold -sw "$TUI_WIDTH"
+    )
+    if ((${#lines[@]} == 0)); then
+        if [[ $status == running ]]; then
+            lines=('Waiting for output...')
+        else
+            lines=('No output.')
         fi
-        printf '\n%s' 'Press Enter to return to the toolbox.'
-        IFS= read -r || return 1
     fi
+
+    printf '\033[H\033[J'
+    style=$TUI_ACCENT
+    case $status in
+        running) status='Running...' ;;
+        success) status='Completed' ;;
+        *) status="Failed (exit $status)"; style=$CLR_RED ;;
+    esac
+    if ((TUI_HEIGHT >= 8)); then
+        tui_line 1 'UBUNTU VLESS' "$TUI_ACCENT"
+        tui_line 2 "$title"
+        tui_line 3 "$status" "$style"
+    else
+        first=2
+        tui_line 1 "$title  |  $status" "$style"
+    fi
+
+    TUI_OUTPUT_ROWS=$((TUI_HEIGHT > first ? TUI_HEIGHT - first : 0))
+    count=${#lines[@]}
+    TUI_OUTPUT_LIMIT=$((count > TUI_OUTPUT_ROWS ? count - TUI_OUTPUT_ROWS : 0))
+    if ((top < 0 || top > TUI_OUTPUT_LIMIT)); then
+        top=$TUI_OUTPUT_LIMIT
+    fi
+    TUI_OUTPUT_TOP=$top
+    last=$((top + TUI_OUTPUT_ROWS < count ? top + TUI_OUTPUT_ROWS : count))
+    for ((index = top; index < last; index++)); do
+        tui_line "$((first + index - top))" "${lines[index]}"
+    done
+    if [[ $status != 'Running...' ]] && ((TUI_HEIGHT >= 2)); then
+        if ((TUI_OUTPUT_LIMIT > 0 && TUI_WIDTH >= 42)); then
+            tui_line "$TUI_HEIGHT" "Enter/Esc Back   Up/Down Scroll   $((top + 1))-$last/$count" "$TUI_MUTED"
+        elif ((TUI_OUTPUT_LIMIT > 0)); then
+            tui_line "$TUI_HEIGHT" 'Enter/Esc Back   Up/Down Scroll' "$TUI_MUTED"
+        else
+            tui_line "$TUI_HEIGHT" 'Enter/Esc Back' "$TUI_MUTED"
+        fi
+    fi
+}
+
+tui_watch_output() {
+    local previous_size=0 size
+    trap - EXIT
+    trap 'exit 0' TERM HUP
+    trap 'TUI_RESIZED=yes' WINCH
+    while true; do
+        sleep 0.5
+        size=$(wc -c <"$TUI_OUTPUT") || return
+        if ((size != previous_size)) || [[ $TUI_RESIZED == yes ]]; then
+            previous_size=$size
+            TUI_RESIZED=no
+            tui_render_output "$1" running -1
+        fi
+    done
+}
+
+tui_review_output() {
+    local title=$1 status=$2 top=-1 dirty=yes step
+    while true; do
+        if [[ $dirty == yes || $TUI_RESIZED == yes ]]; then
+            TUI_RESIZED=no
+            tui_render_output "$title" "$status" "$top"
+        fi
+        tui_key
+        dirty=yes
+        case $TUI_KEY in
+            enter|back) return 0 ;;
+            eof) return 1 ;;
+            up|page-up)
+                step=1
+                if [[ $TUI_KEY == page-up ]]; then step=$TUI_OUTPUT_ROWS; fi
+                top=$((TUI_OUTPUT_TOP > step ? TUI_OUTPUT_TOP - step : 0))
+                ;;
+            down) top=$((TUI_OUTPUT_TOP + 1)) ;;
+            page-down) top=$((TUI_OUTPUT_TOP + TUI_OUTPUT_ROWS)) ;;
+            first) top=0 ;;
+            last) top=-1 ;;
+            *) dirty=no ;;
+        esac
+    done
+}
+
+menu_dispatch() {
+    local action=$1
+    shift
+    if [[ $action == import-vless || ( $action == import-json && ${1:-} == --url-stdin ) ]]; then
+        run_action "$action" "$@" <&3 3<&-
+    else
+        run_action "$action" "$@"
+    fi
+}
+
+menu_run() {
+    local ui=$1 title=$2 status=success result
+    shift 2
+    if [[ $ui != terminal ]]; then
+        menu_dispatch "$@" || true
+        return 0
+    fi
+
+    tui_open
+    if ! TUI_OUTPUT=$(mktemp "$STATE_DIR/ui-output.XXXXXXXX"); then
+        tui_prompt "$title" 'Could not open a private output view. Press Enter to go back.'
+        IFS= read -r
+        return
+    fi
+    tui_render_output "$title" running -1
+    # Keep the action in the foreground with its existing signal and rollback handling.
+    tui_watch_output "$title" <&0 3<&- &
+    TUI_PROGRESS_PID=$!
+    menu_dispatch "$@" >"$TUI_OUTPUT" 2>&1 || status=$?
+    tui_stop_progress
+    result=0
+    tui_review_output "$title" "$status" || result=$?
+    tui_remove_output
+    return "$result"
 }
 
 menu_action() {
