@@ -1106,27 +1106,40 @@ network_firewall_preflight() {
 }
 
 network_dns_preflight() {
-    local output line domain has_local_domains=0
+    local output line scope domain suffix ignored_link=${1:-} has_local_domains=0
     local -a domains
     output=$(timeout 5s resolvectl --no-pager domain 2>/dev/null) || {
         log_error 'Could not inspect systemd-resolved DNS routing domains.'
         return 1
     }
     while IFS= read -r line; do
+        [[ -n $line ]] || continue
+        if [[ $line != *:* ]]; then
+            log_error 'Unexpected DNS domain listing. Check resolvectl domain.'
+            return 1
+        fi
+        scope=${line%%:*}
+        if [[ -n $ignored_link && $scope == 'Link '*" ($ignored_link)" ]]; then
+            continue
+        fi
         IFS=$' \t' read -ra domains <<< "${line#*:}"
         for domain in "${domains[@]}"; do
-            domain=${domain%.}
-            case ${domain,,} in
-                local|*.local|internal|*.internal|localdomain|*.localdomain|lan|*.lan|home.arpa|*.home.arpa)
+            # A search suffix and its route-only form have the same DNS
+            # routing scope for names within that suffix.
+            suffix=${domain#\~}
+            suffix=${suffix%.}
+            case ${suffix,,} in
+                local|*.local|internal|*.internal|localdomain|*.localdomain|lan|*.lan|home.arpa|*.home.arpa|openstacklocal|*.openstacklocal)
                     has_local_domains=1 ;;
                 *)
-                    log_error 'An existing DNS routing or public search domain could bypass the TUN DNS link.'
+                    log_error "DNS domain '$domain' on $scope can route queries outside TUN."
+                    log_error 'Inspect it with resolvectl domain and resolvectl dns.'
                     return 1 ;;
             esac
         done
     done <<< "$output"
-    if (( has_local_domains )); then
-        log_warn 'Local search domains may continue to use their existing DNS link.'
+    if ((has_local_domains)) && [[ -z $ignored_link ]]; then
+        log_warn 'Local DNS domains may continue to use their existing resolver.'
     fi
 }
 
@@ -1382,6 +1395,7 @@ network_verify_tun_dns() {
         log_error 'systemd-resolved lacks the expected TUN DNS server or catch-all DNS domain.'
         return 1
     fi
+    network_dns_preflight "$NETWORK_TUN" || return 1
     for host in api.ipify.org. ipv4.icanhazip.com. v4.ident.me.; do
         if answer=$(LC_ALL=C SYSTEMD_COLORS=0 timeout 7s resolvectl -4 --protocol=dns --cache=no --synthesize=no query "$host" 2>/dev/null) &&
            [[ $answer =~ --[[:space:]]link:[[:space:]]$NETWORK_TUN([[:space:]]|$) ]] &&

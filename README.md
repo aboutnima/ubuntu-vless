@@ -29,6 +29,8 @@ The command uses sudo when needed and preserves the SSH connection details. Use 
 
 The [example VLESS link](examples/client.vless) contains dummy values. TUN needs a working upstream, `/dev/net/tun`, systemd-resolved with the standard Ubuntu stub, and a live SSH connection. If the server has public IPv6 routes, the upstream must support IPv6 egress.
 
+If Start TUN reports a DNS conflict, run `resolvectl domain` and `resolvectl dns` to locate the rule and its resolver. Private search domains such as `openstacklocal` and `*.internal` can keep using local DNS. A competing `~.` or public suffix on another link can divert DNS outside TUN and blocks activation.
+
 ## Confirm TUN after starting
 
 Keep the first SSH session open and wait for the health checks to pass. From the same client IP, open a **new** SSH connection with ControlMaster disabled and run:

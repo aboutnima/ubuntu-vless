@@ -557,6 +557,30 @@ stop_pending_tun() {
         test_fail 'Stop did not clean up both the pending and restored tunnels'
 }
 
+dns_routing_domains() {
+    local case_dir=$1
+    local fixture='Global:
+Link 2 (eth0): openstacklocal. ~Corp.Internal.
+Link 3 (eth1): home.arpa'
+    timeout() { shift; "$@"; }
+    resolvectl() { printf '%s\n' "$fixture"; }
+    network_dns_preflight >"$case_dir/allowed.log" 2>&1
+    grep -Fq 'Local DNS domains may continue' "$case_dir/allowed.log"
+
+    fixture+=$'\nLink 7 (sbtoolbox0): ~.'
+    network_dns_preflight "$NETWORK_TUN"
+    expect_failure "$case_dir" network_dns_preflight
+    grep -Fq "DNS domain '~.' on Link 7 (sbtoolbox0)" "$case_dir/rejection.log"
+
+    fixture+=$'\nLink 8 (another-vpn): ~.'
+    expect_failure "$case_dir" network_dns_preflight "$NETWORK_TUN"
+    grep -Fq "DNS domain '~.' on Link 8 (another-vpn)" "$case_dir/rejection.log"
+
+    fixture='Global: example.com'
+    expect_failure "$case_dir" network_dns_preflight "$NETWORK_TUN"
+    grep -Fq "DNS domain 'example.com' on Global" "$case_dir/rejection.log"
+}
+
 run_case 'VLESS TCP/TLS, Reality, WebSocket and gRPC conversion' vless_transports
 run_case 'malformed input rejected without credential disclosure' invalid_configuration
 run_case 'TUN exclusions and loopback-only proxy listener' tun_configuration
@@ -564,6 +588,7 @@ run_case 'official package metadata, digest, backup and repeat install' installe
 run_case 'digest mismatch rejects the package without changing active config' installer_bad_digest
 run_case 'failed package installation restores the original conffile' installer_failed_package
 run_case 'official sing-box unit accepted and unsupported unit settings rejected' vendor_service_compatibility
+run_case 'private search and split DNS suffixes accepted while competing DNS routes are blocked' dns_routing_domains
 run_case 'SSH route verification and second-session enforcement' ssh_protection
 run_case 'persistent rollback snapshot, failed restoration, retry and idempotence' transaction_rollback
 run_case 'failed timer arming leaves the prior configuration and service running' transaction_timer_failure
