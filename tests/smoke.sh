@@ -581,6 +581,19 @@ Link 3 (eth1): home.arpa'
     grep -Fq "DNS domain 'example.com' on Global" "$case_dir/rejection.log"
 }
 
+forwarding_preflight() {
+    local case_dir=$1 output
+    output=$(network_forwarding_warning 0 0 2>&1) || test_fail 'disabled forwarding failed preflight'
+    [[ -z $output ]] || test_fail 'disabled forwarding produced a warning'
+    output=$(network_forwarding_warning 1 0 2>&1) || test_fail 'IPv4 forwarding incorrectly blocked TUN'
+    grep -Fq 'TUN covers server-local traffic' <<< "$output" ||
+        test_fail 'IPv4 forwarding did not explain the TUN scope'
+    output=$(network_forwarding_warning 0 1 2>&1) || test_fail 'IPv6 forwarding incorrectly blocked TUN'
+    grep -Fq 'TUN covers server-local traffic' <<< "$output" ||
+        test_fail 'IPv6 forwarding did not explain the TUN scope'
+    : >"$case_dir/forwarding-preflight.log"
+}
+
 run_case 'VLESS TCP/TLS, Reality, WebSocket and gRPC conversion' vless_transports
 run_case 'malformed input rejected without credential disclosure' invalid_configuration
 run_case 'TUN exclusions and loopback-only proxy listener' tun_configuration
@@ -588,6 +601,7 @@ run_case 'official package metadata, digest, backup and repeat install' installe
 run_case 'digest mismatch rejects the package without changing active config' installer_bad_digest
 run_case 'failed package installation restores the original conffile' installer_failed_package
 run_case 'official sing-box unit accepted and unsupported unit settings rejected' vendor_service_compatibility
+run_case 'enabled packet forwarding warns but does not block host TUN' forwarding_preflight
 run_case 'private search and split DNS suffixes accepted while competing DNS routes are blocked' dns_routing_domains
 run_case 'SSH route verification and second-session enforcement' ssh_protection
 run_case 'persistent rollback snapshot, failed restoration, retry and idempotence' transaction_rollback

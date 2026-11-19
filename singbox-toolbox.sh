@@ -1165,6 +1165,22 @@ else:
 ' <<< "$routes"
 }
 
+network_forwarding_warning() {
+    local ipv4=$1 ipv6=$2
+    if [[ $ipv4 != 0 || $ipv6 != 0 ]]; then
+        log_warn 'IP forwarding is enabled. TUN covers server-local traffic; forwarded router or container traffic may bypass it.'
+    fi
+}
+
+network_forwarding_preflight() {
+    local ipv4 ipv6=0
+    ipv4=$(</proc/sys/net/ipv4/ip_forward)
+    if [[ -r /proc/sys/net/ipv6/conf/all/forwarding ]]; then
+        ipv6=$(</proc/sys/net/ipv6/conf/all/forwarding)
+    fi
+    network_forwarding_warning "$ipv4" "$ipv6"
+}
+
 network_tun_preflight() {
     local family links rules routes addresses
     if [[ ! -c /dev/net/tun ]] || ! ( exec 3<>/dev/net/tun ) 2>/dev/null; then
@@ -1178,11 +1194,7 @@ network_tun_preflight() {
         return 1
     fi
     network_dns_preflight || return 1
-    if [[ $(</proc/sys/net/ipv4/ip_forward) != 0 ||
-          ( -r /proc/sys/net/ipv6/conf/all/forwarding && $(</proc/sys/net/ipv6/conf/all/forwarding) != 0 ) ]]; then
-        log_error 'Packet forwarding is enabled. Use proxy mode on routers and container forwarding hosts.'
-        return 1
-    fi
+    network_forwarding_preflight
     links=$(ip -j -d link show 2>/dev/null) || {
         log_error 'Could not inspect existing network interfaces.'
         return 1
