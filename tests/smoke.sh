@@ -594,6 +594,42 @@ forwarding_preflight() {
     : >"$case_dir/forwarding-preflight.log"
 }
 
+tun_link_preflight() {
+    local case_dir=$1
+    local sample fixture master
+    sample='[
+      {"ifindex": 1, "ifname": "lo", "flags": ["UP", "LOWER_UP"], "operstate": "UNKNOWN"},
+      {"ifindex": 2, "ifname": "eth0", "flags": ["UP", "LOWER_UP"], "operstate": "UP"},
+      {"ifindex": 3, "ifname": "docker0", "flags": ["UP"], "operstate": "DOWN", "linkinfo": {"info_kind": "bridge"}}
+    ]'
+    ip() { printf '%s\n' "$fixture"; }
+
+    fixture=$sample
+    network_tun_link_preflight
+
+    fixture=$(jq '.[2].flags += ["LOWER_UP"]' <<< "$sample")
+    expect_failure "$case_dir" network_tun_link_preflight
+    grep -Fq 'docker0 (bridge, DOWN)' "$case_dir/rejection.log"
+
+    for master in '"docker0"' '3'; do
+        fixture=$(jq --argjson master "$master" '. + [{"ifname":"veth0","master":$master,"flags":[]}]' <<< "$sample")
+        expect_failure "$case_dir" network_tun_link_preflight
+        grep -Fq 'docker0 (bridge, DOWN)' "$case_dir/rejection.log"
+    done
+
+    fixture=$(jq '.[2].ifname = "br-test"' <<< "$sample")
+    expect_failure "$case_dir" network_tun_link_preflight
+    grep -Fq 'br-test (bridge, DOWN)' "$case_dir/rejection.log"
+
+    fixture=$(jq '. + [{"ifname":"sbtoolbox0","flags":[],"operstate":"DOWN","linkinfo":{"info_kind":"tun"}}]' <<< "$sample")
+    expect_failure "$case_dir" network_tun_link_preflight
+    grep -Fq 'sbtoolbox0 (tun, DOWN)' "$case_dir/rejection.log"
+    network_tun_link_preflight "$NETWORK_TUN"
+
+    fixture='{"unexpected":true}'
+    expect_failure "$case_dir" network_tun_link_preflight
+}
+
 run_case 'VLESS TCP/TLS, Reality, WebSocket and gRPC conversion' vless_transports
 run_case 'malformed input rejected without credential disclosure' invalid_configuration
 run_case 'TUN exclusions and loopback-only proxy listener' tun_configuration
@@ -603,6 +639,7 @@ run_case 'failed package installation restores the original conffile' installer_
 run_case 'official sing-box unit accepted and unsupported unit settings rejected' vendor_service_compatibility
 run_case 'enabled packet forwarding warns but does not block host TUN' forwarding_preflight
 run_case 'private search and split DNS suffixes accepted while competing DNS routes are blocked' dns_routing_domains
+run_case 'idle docker0 without ports is accepted; bridged traffic and other TUN conflicts are blocked' tun_link_preflight
 run_case 'SSH route verification and second-session enforcement' ssh_protection
 run_case 'persistent rollback snapshot, failed restoration, retry and idempotence' transaction_rollback
 run_case 'failed timer arming leaves the prior configuration and service running' transaction_timer_failure

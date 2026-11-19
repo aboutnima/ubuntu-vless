@@ -1181,8 +1181,49 @@ network_forwarding_preflight() {
     network_forwarding_warning "$ipv4" "$ipv6"
 }
 
+network_tun_link_preflight() {
+    local ignored_tun=${1:-} links conflicts
+    links=$(ip -j -d link show 2>/dev/null) || {
+        log_error 'Could not inspect existing network interfaces.'
+        return 1
+    }
+    conflicts=$(jq -r --arg tun "$NETWORK_TUN" --arg ignored_tun "$ignored_tun" '
+        def idle_docker_bridge($links):
+            . as $bridge
+            | .ifname == "docker0"
+              and .linkinfo.info_kind == "bridge"
+              and .operstate == "DOWN"
+              and ((.flags | index("LOWER_UP")) == null)
+              and .master == null
+              and (.ifindex | type == "number")
+              and (any($links[]; .master != null and
+                  (.master == $bridge.ifname or
+                   (.master | tostring) == ($bridge.ifindex | tostring))) | not);
+        if type != "array" then error("expected link array") else . end
+        | . as $links
+        | [
+            .[]
+            | select(.ifname != $ignored_tun)
+            | select(.ifname == $tun or
+                (((.flags // []) | index("UP")) != null and
+                 (((.linkinfo.info_kind // "") | IN("tun","wireguard","xfrm","gre","gretap","ipip","sit","vti","vti6","bridge")) or
+                  (.ifname | test("^(tun[0-9]|tap[0-9]|wg[0-9]|ppp[0-9]|tailscale|zt[a-z0-9]|docker|podman|cni|flannel|virbr|lxcbr|br-[a-f0-9])")))))
+            | select(idle_docker_bridge($links) | not)
+            | "\(.ifname) (\(.linkinfo.info_kind // "unknown"), \(.operstate // "unknown"))"
+          ]
+        | join(", ")
+    ' <<< "$links" 2>/dev/null) || {
+        log_error 'Could not parse the network interface list.'
+        return 1
+    }
+    if [[ -n $conflicts ]]; then
+        log_error "Network interfaces conflict with TUN ($conflicts)."
+        return 1
+    fi
+}
+
 network_tun_preflight() {
-    local family links rules routes addresses
+    local family rules routes addresses
     if [[ ! -c /dev/net/tun ]] || ! ( exec 3<>/dev/net/tun ) 2>/dev/null; then
         log_error 'The kernel TUN device /dev/net/tun is unavailable.'
         return 1
@@ -1195,19 +1236,7 @@ network_tun_preflight() {
     fi
     network_dns_preflight || return 1
     network_forwarding_preflight
-    links=$(ip -j -d link show 2>/dev/null) || {
-        log_error 'Could not inspect existing network interfaces.'
-        return 1
-    }
-    if jq -e --arg tun "$NETWORK_TUN" '
-        any(.[]; .ifname == $tun or
-            (((.flags // []) | index("UP")) != null and
-             (((.linkinfo.info_kind // "") | IN("tun","wireguard","xfrm","gre","gretap","ipip","sit","vti","vti6","bridge")) or
-              ((.ifname // "") | test("^(tun[0-9]|tap[0-9]|wg[0-9]|ppp[0-9]|tailscale|zt[a-z0-9]|docker|podman|cni|flannel|virbr|lxcbr|br-[a-f0-9])")))))
-        ' <<< "$links" >/dev/null; then
-        log_error 'An active tunnel or bridge, or the reserved toolbox interface, conflicts with TUN.'
-        return 1
-    fi
+    network_tun_link_preflight || return 1
     for family in 4 6; do
         rules=$(ip "-$family" -N -j rule show 2>/dev/null) || {
             log_error 'Could not inspect policy-routing rules.'
@@ -1484,6 +1513,9 @@ network_health() {
     if ! pid=$(network_active_service_pid) || [[ $pid != "$initial_pid" ]]; then
         log_error 'The sing-box process stopped or restarted during connectivity tests.'
         return 1
+    fi
+    if [[ $mode == tun ]]; then
+        network_tun_link_preflight "$NETWORK_TUN" || return 1
     fi
 }
 

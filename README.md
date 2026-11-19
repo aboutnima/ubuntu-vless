@@ -31,6 +31,8 @@ The [example VLESS link](examples/client.vless) contains dummy values. TUN needs
 
 If Start TUN reports a DNS conflict, run `resolvectl domain` and `resolvectl dns` to locate the rule and its resolver. Private search domains such as `openstacklocal` and `*.internal` can keep using local DNS. A competing `~.` or public suffix on another link can divert DNS outside TUN and blocks activation.
 
+An idle Docker default bridge is accepted when it has no attached ports or carrier. Start TUN reports the name of any conflicting bridge or tunnel. The TUN checks cover traffic from the Ubuntu server itself; forwarded traffic can take a different route.
+
 ## Confirm TUN after starting
 
 Keep the first SSH session open and wait for the health checks to pass. From the same client IP, open a **new** SSH connection with ControlMaster disabled and run:
