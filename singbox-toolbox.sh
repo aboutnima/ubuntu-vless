@@ -6,6 +6,8 @@ set +x
 umask 077
 
 STATE_DIR=/var/lib/singbox-toolbox
+LAUNCHER=/usr/local/bin/ubuntu-vless
+TOOLBOX_REMOTE=https://github.com/aboutnima/ubuntu-vless.git
 CONFIG_DIR=/etc/sing-box
 CONFIG_FILE=$CONFIG_DIR/config.json
 UNIT_DIR=/etc/systemd/system
@@ -162,6 +164,61 @@ require_box() {
         fail "sing-box $version is installed. Upgrade it to stable 1.14 or later using its original package source."
         return 1
     fi
+}
+
+is_toolbox_script() {
+    local shebang label
+    { IFS= read -r shebang && IFS= read -r label; } <"$1" &&
+        [[ $shebang == '#!/bin/bash' && $label == '# singbox-toolbox.sh — sing-box client management for Ubuntu with systemd.' ]]
+}
+
+launcher_available() {
+    if [[ -L $LAUNCHER ]] ||
+        { [[ -e $LAUNCHER ]] && { [[ ! -f $LAUNCHER ]] || ! is_toolbox_script "$LAUNCHER"; }; }; then
+        fail "The command path $LAUNCHER is occupied by another file. Move it before installing this toolbox."
+        return 1
+    fi
+}
+
+install_launcher() {
+    local source=$1
+    launcher_available || return 1
+    if ! is_toolbox_script "$source" || ! /bin/bash -n "$source"; then
+        fail 'The toolbox script failed validation.'
+        return 1
+    fi
+    [[ -d ${LAUNCHER%/*} ]] || install -d -m 0755 -- "${LAUNCHER%/*}" || return 1
+    if [[ ! -x $LAUNCHER ]] || ! cmp -s "$source" "$LAUNCHER"; then
+        atomic_copy "$source" "$LAUNCHER" 0755 || return 1
+    fi
+    log_info 'Run ubuntu-vless to open the toolbox.'
+}
+
+update_toolbox() {
+    local repo="$SCRATCH/update" candidate="$SCRATCH/ubuntu-vless" revision
+    launcher_available || return 1
+    if ! command -v git >/dev/null; then
+        log_info 'Installing Git from Ubuntu.'
+        if ! apt-get -q update ||
+            ! DEBIAN_FRONTEND=noninteractive apt-get -qy install --no-install-recommends git ca-certificates; then
+            fail 'Git installation failed.'
+            return 1
+        fi
+    fi
+    if ! revision=$(
+        export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
+        unset GIT_SSL_NO_VERIFY GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+        git init --quiet --template= "$repo" &&
+            timeout 90s git -C "$repo" -c protocol.allow=never -c protocol.https.allow=always \
+                -c http.sslVerify=true fetch --quiet --depth=1 "$TOOLBOX_REMOTE" refs/heads/main &&
+            git -C "$repo" show FETCH_HEAD:singbox-toolbox.sh >"$candidate" &&
+            git -C "$repo" rev-parse --short FETCH_HEAD
+    ); then
+        fail 'Could not fetch the toolbox from GitHub.'
+        return 1
+    fi
+    install_launcher "$candidate" || return 1
+    log_info "Toolbox updated to Git commit $revision. Run ubuntu-vless again to load it."
 }
 
 install_dependencies() {
@@ -1073,8 +1130,30 @@ network_dns_preflight() {
     fi
 }
 
+network_tun_ipv6_mode() {
+    local routes
+    routes=$(ip -6 -N -j route show table all 2>/dev/null) ||
+        { fail 'Could not inspect public IPv6 routes.'; return 1; }
+    python3 -c '
+import ipaddress
+import json
+import sys
+
+public_range = ipaddress.ip_network("2000::/3")
+for route in json.load(sys.stdin):
+    if str(route.get("table", "main")) not in ("main", "254") or route.get("type", "unicast") != "unicast":
+        continue
+    target = route.get("dst", "default")
+    if target == "default" or ipaddress.ip_network(target, strict=False).overlaps(public_range):
+        print("yes")
+        break
+else:
+    print("no")
+' <<< "$routes"
+}
+
 network_tun_preflight() {
-    local family links rules routes addresses global_v6
+    local family links rules routes addresses
     if [[ ! -c /dev/net/tun ]] || ! ( exec 3<>/dev/net/tun ) 2>/dev/null; then
         log_error 'The kernel TUN device /dev/net/tun is unavailable.'
         return 1
@@ -1153,22 +1232,13 @@ PY
             return 1
         fi
     done
-    global_v6=$(ip -6 -N -j route show table main 2>/dev/null) || return 1
-    if [[ $1 != yes ]] && ! python3 -c '
-import ipaddress
-import json
-import sys
-
-public_range = ipaddress.ip_network("2000::/3")
-for route in json.load(sys.stdin):
-    if route.get("type", "unicast") != "unicast":
-        continue
-    target = route.get("dst", "default")
-    if target == "default" or ipaddress.ip_network(target, strict=False).overlaps(public_range):
-        sys.exit(1)
-' <<< "$global_v6"; then
-        log_error 'Public IPv6 routing is available. Enable verified IPv6 TUN routing or use proxy mode.'
-        return 1
+    if [[ $1 != yes ]]; then
+        local ipv6_mode
+        ipv6_mode=$(network_tun_ipv6_mode) || return 1
+        if [[ $ipv6_mode == yes ]]; then
+            log_error 'Public IPv6 routing is available. Use enable-tun --auto or --ipv6.'
+            return 1
+        fi
     fi
     network_firewall_preflight
 }
@@ -1411,11 +1481,22 @@ service_compatible() {
     user=$(systemctl show "$UNIT" --property=User --value) || return 1
     drop_ins=$(systemctl show "$UNIT" --property=DropInPaths --value) || return 1
     state=$(systemctl show "$UNIT" --property=ActiveState --value) || return 1
-    if [[ $fragment != /usr/lib/systemd/system/sing-box.service && $fragment != /lib/systemd/system/sing-box.service ]] ||
-        [[ $user != "" && $user != root ]] ||
-        [[ -n $drop_ins && $drop_ins != "$DROP_IN" ]] ||
-        [[ $state != active && $state != inactive && $state != failed ]]; then
-        fail 'This service has an unsupported unit, custom overrides, or a pending state transition.'
+    if [[ $fragment != /usr/lib/systemd/system/sing-box.service && $fragment != /lib/systemd/system/sing-box.service ]]; then
+        fail "Unsupported sing-box unit path: ${fragment:-not found}. Install the official Ubuntu package."
+        return 1
+    fi
+    # Current official packages run as sing-box with the ambient capabilities
+    # needed for TUN and access to the root-owned config.
+    if [[ -n $user && $user != root && $user != sing-box ]]; then
+        fail "Unsupported sing-box service account: $user."
+        return 1
+    fi
+    if [[ -n $drop_ins && $drop_ins != "$DROP_IN" ]]; then
+        fail "Custom sing-box systemd drop-ins are present: $drop_ins"
+        return 1
+    fi
+    if [[ $state != active && $state != inactive && $state != failed ]]; then
+        fail "sing-box is in the '$state' state. Wait for the service transition to finish and retry."
         return 1
     fi
     managed_mode >/dev/null || { fail 'The toolbox drop-in name is occupied.'; return 1; }
@@ -1579,7 +1660,7 @@ stop_service() {
 
 start_service() {
     timeout 55s systemctl start "$UNIT" >/dev/null 2>&1 ||
-        { fail 'The service could not be started. Use the logs menu for a redacted event summary.'; return 1; }
+        { fail 'The service could not be started. Run ubuntu-vless logs for a redacted event summary.'; return 1; }
 }
 
 restore_snapshot() {
@@ -1745,6 +1826,9 @@ quiesce_managed_tun() {
 stage_activation() {
     local mode=$1 ipv6=$2 profile=$3 direct4='' direct6=''
     local candidate="$SCRATCH/config.json"
+    if [[ $mode == tun && $ipv6 == auto ]]; then
+        ipv6=$(network_tun_ipv6_mode) || return 1
+    fi
     network_preflight "$mode" "$ipv6" || return 1
     log_info 'Checking direct public IPv4 egress.'
     if ! direct4=$(network_public_ip direct 4); then
@@ -1963,6 +2047,25 @@ stop_box() {
     log_info 'sing-box is stopped.'
 }
 
+stop_tun() {
+    local snapshot mode
+    if [[ -e $STATE_DIR/pending ]]; then
+        snapshot=$(read_pointer pending) ||
+            { fail 'The pending rollback could not be identified.'; return 1; }
+        if [[ ! -f $snapshot/new-ipv6 && ! -f $snapshot/owns-tun ]]; then
+            fail 'Another toolbox operation is pending. Try again after it finishes.'
+            return 1
+        fi
+        rollback_pending || return 1
+    fi
+    mode=$(managed_mode) || { fail 'The toolbox could not identify its managed service.'; return 1; }
+    if [[ $mode == tun ]]; then
+        stop_box || return 1
+    else
+        log_info 'TUN is off.'
+    fi
+}
+
 restore_previous() {
     local snapshot previous_mode current_mode ipv6=no direct='' after=''
     reject_pending && require_network_tools && require_box && safe_config_paths && service_compatible || return 1
@@ -2015,12 +2118,15 @@ usage() {
     cat <<'EOF'
 Usage: sudo bash singbox-toolbox.sh [COMMAND]
 
+  setup                    Install the ubuntu-vless launcher
   install                  Install sing-box and missing runtime dependencies
+  update                   Fetch the latest toolbox from GitHub
   import-vless FILE|-      Stage a VLESS link from a private file or stdin
   import-json FILE|-       Stage a JSON client profile
   import-json --url-stdin  Read an HTTPS configuration URL from stdin
   enable-proxy             Start SOCKS5 and HTTP on 127.0.0.1:1080
-  enable-tun [--ipv6]      Enable TUN with automatic rollback pending confirmation
+  enable-tun [--auto|--ipv6]  Enable TUN with rollback pending SSH confirmation
+  stop-tun                 Stop the toolbox tunnel or cancel a pending start
   confirm                  Confirm a pending TUN activation from a second SSH connection
   test                     Test loopback SOCKS5 connectivity
   ip                       Report the server's current public IPv4
@@ -2030,14 +2136,14 @@ Usage: sudo bash singbox-toolbox.sh [COMMAND]
   uninstall --yes          Remove the Debian package and retain config and backups
   help                     Show this help
 
-Run without a command for the keyboard-driven terminal interface.
+Run ubuntu-vless without arguments to open the terminal interface.
 Use menu --plain for a numbered menu. Use sudo
 --preserve-env=SSH_CONNECTION for enable-tun, confirm, and TUN restart/restore.
 EOF
 }
 
 run_action() {
-    local action=$1 result=0 wait_seconds=0
+    local action=$1 result=0 wait_seconds=0 ipv6=no
     shift
     if [[ $action == _rollback ]]; then
         wait_seconds=20
@@ -2048,16 +2154,23 @@ run_action() {
         return 1
     fi
     case $action in
-        install) install_box || result=$? ;;
+        setup) install_launcher "${BASH_SOURCE[0]}" || result=$? ;;
+        install)
+            install_box || result=$?
+            if ((result == 0)) && [[ ! -x $LAUNCHER ]]; then
+                install_launcher "${BASH_SOURCE[0]}" || result=$?
+            fi ;;
+        update) update_toolbox || result=$? ;;
         import-vless) import_profile vless "$1" || result=$? ;;
         import-json) import_profile json "$1" || result=$? ;;
         enable-proxy) activate_profile proxy no || result=$? ;;
         enable-tun)
-            if [[ ${1:-} == --ipv6 ]]; then
-                activate_profile tun yes || result=$?
-            else
-                activate_profile tun no || result=$?
-            fi ;;
+            case ${1:-} in
+                --auto) ipv6=auto ;;
+                --ipv6) ipv6=yes ;;
+            esac
+            activate_profile tun "$ipv6" || result=$? ;;
+        stop-tun) stop_tun || result=$? ;;
         confirm) confirm_tun || result=$? ;;
         test) test_connection || result=$? ;;
         ip) show_public_ip || result=$? ;;
@@ -2290,11 +2403,12 @@ tui_select() {
             last) focus=$((count - 1)) ;;
             enter) TUI_CHOICE=$focus; return 0 ;;
             back|eof) return 1 ;;
-            refresh) tui_refresh ;;
+            refresh) TUI_CHOICE=$focus; return 2 ;;
             idle)
                 if [[ $TUI_PENDING == yes && ! -e $STATE_DIR/pending ]] ||
                    [[ $TUI_PENDING == no && -e $STATE_DIR/pending ]]; then
-                    tui_refresh
+                    TUI_CHOICE=$focus
+                    return 2
                 elif [[ $TUI_PENDING == no ]]; then
                     dirty=no
                 fi ;;
@@ -2440,7 +2554,9 @@ menu_run() {
     local ui=$1 title=$2 status=success result
     shift 2
     if [[ $ui != terminal ]]; then
-        menu_dispatch "$@" || true
+        if menu_dispatch "$@" && [[ $1 == update ]]; then
+            return 1
+        fi
         return 0
     fi
 
@@ -2459,14 +2575,16 @@ menu_run() {
     result=0
     tui_review_output "$title" "$status" || result=$?
     tui_remove_output
+    # A successful update replaces the launcher. End this session so a later
+    # operation cannot mix the old running code with the new recovery runner.
+    if [[ $1 == update && $status == success ]]; then
+        return 1
+    fi
     return "$result"
 }
 
 menu_action() {
-    local ui=$1 action=$2 title=$3 input source
-    local -a dialog_labels dialog_details
-    # The dialog arrays are used through tui_select/tui_render namerefs.
-    # shellcheck disable=SC2034
+    local ui=$1 action=$2 title=$3 input
     case $action in
         import-vless)
             if [[ $ui == terminal ]]; then
@@ -2475,98 +2593,30 @@ menu_action() {
             IFS= read -rs -p 'VLESS URL (hidden): ' input || return 1
             printf '\n'
             if [[ -n $input ]]; then
-                # Only the action gets the here-string. The return prompt still reads the SSH terminal.
                 menu_run "$ui" "$title" import-vless - 3<<<"$input" || return 1
             fi ;;
-        import-json)
-            if [[ $ui == terminal ]]; then
-                dialog_labels=('Local JSON file' 'HTTPS URL' 'Back')
-                dialog_details=('Read a file already on this Ubuntu server.' 'Paste the final HTTPS URL with input hidden.' 'Return to the action list.')
-                tui_select "$title" 'Choose a source for the client profile.' dialog_labels dialog_details || return 0
-                case $TUI_CHOICE in 0) source=f ;; 1) source=u ;; *) return 0 ;; esac
-            else
-                IFS= read -r -p 'Import [f]ile or [u]rl? ' source || return 1
-            fi
-            case $source in
-                f)
-                    if [[ $ui == terminal ]]; then
-                        tui_prompt "$title" 'Enter a path on this server. Empty input goes back.'
-                    fi
-                    IFS= read -r -p 'Local JSON path: ' input || return 1
-                    if [[ -n $input ]]; then
-                        menu_run "$ui" "$title" import-json "$input" || return 1
-                    fi ;;
-                u)
-                    if [[ $ui == terminal ]]; then
-                        tui_prompt "$title" 'Paste the full HTTPS URL. Empty input goes back.'
-                    fi
-                    IFS= read -rs -p 'HTTPS URL (hidden): ' input || return 1
-                    printf '\n'
-                    if [[ -n $input ]]; then
-                        menu_run "$ui" "$title" import-json --url-stdin 3<<<"$input" || return 1
-                    fi ;;
-                *) log_warn 'Enter f or u.' ;;
-            esac ;;
-        enable-tun)
-            if [[ $ui == terminal ]]; then
-                dialog_labels=('IPv4' 'IPv4 and IPv6' 'Back')
-                dialog_details=('Use on a server without a public IPv6 route.' 'Tunnel both families through a dual-stack upstream.' 'Return without changing routing.')
-                tui_select "$title" 'Keep this SSH session open. Rollback stays armed for five minutes.' dialog_labels dialog_details 2 || return 0
-                case $TUI_CHOICE in 0) input=n ;; 1) input=y ;; *) return 0 ;; esac
-            else
-                IFS= read -r -p 'Tunnel IPv6 as well? [y/N] ' input || return 1
-            fi
-            if [[ $input == [yY] ]]; then
-                menu_run "$ui" "$title" enable-tun --ipv6 || return 1
-            else
-                menu_run "$ui" "$title" enable-tun || return 1
-            fi ;;
-        restore)
-            if [[ -e $STATE_DIR/pending ]]; then
-                menu_run "$ui" 'Roll back pending change' rollback || return 1
-            else
-                menu_run "$ui" "$title" restore || return 1
-            fi ;;
-        uninstall)
-            if [[ $ui == terminal ]]; then
-                tui_prompt "$title" 'The package is removed. Configuration and backups stay on disk.'
-            fi
-            IFS= read -r -p 'Type UNINSTALL to continue: ' input || return 1
-            if [[ $input == UNINSTALL ]]; then
-                menu_run "$ui" "$title" uninstall --yes || return 1
-            fi ;;
-        *)
-            menu_run "$ui" "$title" "$action" || return 1 ;;
+        enable-tun) menu_run "$ui" "$title" enable-tun --auto ;;
+        *) menu_run "$ui" "$title" "$action" ;;
     esac
+}
+
+tui_has_running_tun() {
+    [[ -e $STATE_DIR/pending ]] ||
+        { [[ $(managed_mode 2>/dev/null) == tun ]] &&
+            { [[ -e $TUN_PERMIT ]] || timeout 2s systemctl is-active --quiet "$UNIT"; }; }
 }
 
 menu() {
     local ui=terminal focus=0 selection index title
-    local -a actions=(install import-vless import-json enable-proxy enable-tun test ip status logs restart stop restore uninstall confirm exit)
-    local -a labels=(
-        'Install sing-box' 'Import VLESS link' 'Import JSON profile'
-        'Enable loopback proxy' 'Enable full-server TUN' 'Test proxy connection' 'Show public IP'
-        'Service status' 'View logs' 'Restart sing-box' 'Stop sing-box'
-        'Restore previous configuration' 'Uninstall sing-box' 'Confirm TUN' 'Exit'
-    )
+    local -a actions=(install import-vless enable-tun update)
+    local -a labels=('Install sing-box' 'Import VLESS link' 'Start TUN' 'Update toolbox')
     # Read by tui_render through a nameref.
     # shellcheck disable=SC2034
     local -a details=(
-        'Install the stable package or check the version already installed.'
-        'Stage a VLESS link without echoing it to the terminal.'
-        'Stage a profile from a local file or HTTPS.'
-        'Start SOCKS5 and HTTP on 127.0.0.1:1080 and test the connection.'
-        'Route server traffic through sing-box with an SSH rollback timer.'
-        'Check the running proxy and display its public egress.'
-        'Check the public IPv4 address used by this server.'
-        'Show the daemon state and any pending rollback deadline.'
-        'Read recent systemd events with credentials withheld.'
-        'Restart the managed service and rerun its connection checks.'
-        'Stop sing-box and remove its managed TUN routes.'
-        'Restore the last snapshot or roll back a pending change now.'
-        'Remove the Debian package while retaining your configuration.'
-        'Confirm from the new SSH session after TUN health checks pass.'
-        'Close this terminal interface.'
+        'Install sing-box or check the version already installed.'
+        'Import one VLESS link with the input hidden.'
+        'Start the tunnel and confirm from a new SSH session.'
+        'Fetch the latest toolbox from GitHub.'
     )
     if [[ ${1:-} == --plain || ! -t 1 || ${TERM:-dumb} == dumb || ${TERM:-} == unknown || ${TERM:-} == linux ]]; then
         ui=plain
@@ -2580,30 +2630,39 @@ menu() {
         tui_refresh
     fi
     while true; do
+        if tui_has_running_tun; then
+            actions[2]=stop-tun
+            labels[2]='Stop TUN'
+            # shellcheck disable=SC2034
+            details[2]='Stop the tunnel or cancel a pending start.'
+        else
+            actions[2]=enable-tun
+            labels[2]='Start TUN'
+            # shellcheck disable=SC2034
+            details[2]='Start the tunnel and confirm from a new SSH session.'
+        fi
         if [[ $ui == terminal ]]; then
-            if [[ $TUI_PENDING == yes ]]; then
-                labels[11]='Roll back pending change'
-            else
-                labels[11]='Restore previous configuration'
-            fi
-            if ! tui_select 'ACTIONS' '' labels details "$focus"; then
-                break
-            fi
+            selection=0
+            tui_select 'ACTIONS' '' labels details "$focus" || selection=$?
             focus=$TUI_CHOICE
+            case $selection in
+                2) tui_refresh; continue ;;
+                0) ;;
+                *) break ;;
+            esac
         else
             printf '\n%s\n' 'Ubuntu VLESS'
-            for ((index = 0; index < ${#actions[@]} - 1; index++)); do
+            for index in "${!actions[@]}"; do
                 printf '%2d. %s\n' "$((index + 1))" "${labels[index]}"
             done
             printf '%s\n' ' 0. Exit'
             IFS= read -r -p '> ' selection || break
             case $selection in
                 0) break ;;
-                [1-9]|1[0-4]) focus=$((selection - 1)) ;;
+                [1-4]) focus=$((selection - 1)) ;;
                 *) log_warn 'Choose a number from the menu.'; continue ;;
             esac
         fi
-        [[ ${actions[focus]} != exit ]] || break
         title=${labels[focus]}
         menu_action "$ui" "${actions[focus]}" "$title" || break
         if [[ $ui == terminal ]]; then
@@ -2618,13 +2677,17 @@ main() {
     case $action in
         help|-h|--help) usage; return 0 ;;
         menu) [[ $# -le 1 || ( $# == 2 && $2 == --plain ) ]] || { usage >&2; return 2; } ;;
-        install|enable-proxy|confirm|test|ip|status|logs|restart|stop|restore|rollback|_rollback)
+        setup|install|update|enable-proxy|confirm|test|ip|status|logs|restart|stop|stop-tun|restore|rollback|_rollback)
             (($# <= 1)) || { usage >&2; return 2; } ;;
         import-vless|import-json) (($# == 2)) || { usage >&2; return 2; } ;;
-        enable-tun) [[ $# == 1 || ( $# == 2 && $2 == --ipv6 ) ]] || { usage >&2; return 2; } ;;
+        enable-tun) [[ $# == 1 || ( $# == 2 && ( $2 == --auto || $2 == --ipv6 ) ) ]] || { usage >&2; return 2; } ;;
         uninstall) [[ $# == 2 && $2 == --yes ]] || { usage >&2; return 2; } ;;
         *) usage >&2; return 2 ;;
     esac
+    if ((EUID != 0)) && [[ ${BASH_SOURCE[0]} -ef $LAUNCHER ]]; then
+        require_commands sudo || return 1
+        exec sudo --preserve-env=SSH_CONNECTION -- "$LAUNCHER" "$@"
+    fi
     export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     export LC_ALL=C SYSTEMD_COLORS=0 SYSTEMD_PAGER=cat
     trap 'log_error "Unexpected toolbox failure near line $LINENO."' ERR

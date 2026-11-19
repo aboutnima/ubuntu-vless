@@ -24,6 +24,7 @@ STATE_DIR=$2
 managed_mode() { printf '%s\n' proxy; }
 locate_box() { return 1; }
 runtime_init() { return 0; }
+tui_has_running_tun() { [[ -e $STATE_DIR/mock-tunnel ]]; }
 systemctl() {
     case "$1" in
         is-active) return 1 ;;
@@ -44,26 +45,24 @@ run_action() {
                 return 1
             fi
             ;;
-        import-json)
-            IFS= read -r value
-            if [[ $value == 'https://vpn.example.test/profile.json?token=keyboard-test-dummy' ]]; then
-                printf '%s\n' json-input-ok >>"$STATE_DIR/actions"
-            else
-                printf '%s\n' json-input-bad >>"$STATE_DIR/actions"
-                return 1
-            fi
-            ;;
-        logs)
-            printf '%s\n' 'First journal entry'
+        install)
+            printf '%s\n' 'First installer line'
             sleep 1.2
             for value in {2..20}; do
-                printf 'Journal entry %s\n' "$value"
+                printf 'Installer line %s\n' "$value"
             done
-            printf '\033[?1049l%s\n' 'Last journal entry'
+            printf '\033[?1049l%s\n' 'Last installer line'
             ;;
-        test)
-            printf '%s\n' 'Fixture connectivity failed.' >&2
-            return 42
+        enable-tun)
+            if [[ -e $STATE_DIR/allow-start ]]; then
+                : >"$STATE_DIR/mock-tunnel"
+            else
+                printf '%s\n' 'Fixture connectivity failed.' >&2
+                return 42
+            fi
+            ;;
+        stop-tun)
+            rm -f "$STATE_DIR/mock-tunnel"
             ;;
     esac
     printf '%s\n' 'Fixture action finished.'
@@ -204,7 +203,8 @@ VLESS_PROMPT = b"VLESS URL (hidden): "
 VLESS_TOKEN = b"vless://dummy-keyboard-test@vpn.example.test:443"
 RETURN_PROMPT = b"Enter/Esc Back"
 ALT_SCREEN_EXIT = b"\x1b[?1049l"
-JSON_URL = b"https://vpn.example.test/profile.json?token=keyboard-test-dummy"
+START_TUN = b"Start TUN"
+STOP_TUN = b"Stop TUN"
 
 
 def credential_case(toolbox, bash, tmp):
@@ -225,28 +225,27 @@ def credential_case(toolbox, bash, tmp):
         tty.assert_exit()
 
 
-def json_case(toolbox, bash, tmp):
+def toggle_case(toolbox, bash, tmp):
+    (tmp / "allow-start").touch()
     with Terminal(toolbox, bash, tmp) as tty:
-        tty.expect(b"Import JSON profile")
+        tty.expect(START_TUN)
+        dashboard = tty.expect(b"Update toolbox")
+        for removed in (b"Import JSON profile", b"View logs", b"Service status", b"Enable loopback proxy"):
+            assert removed not in tty.transcript
         tty.send(b"jj\r")
-        dialog = tty.expect(b"HTTPS URL")
-        tty.expect_echo_disabled()
-        tty.send(b"\x1b")
-        dashboard = tty.expect(b"ACTIONS", start=dialog)
-        tty.expect_echo_disabled()
+        review = tty.expect(RETURN_PROMPT, start=dashboard)
+        tty.expect_actions("enable-tun --auto")
         tty.send(b"\r")
-        dialog = tty.expect(b"HTTPS URL", start=dashboard)
-        tty.expect_echo_disabled()
-        tty.send(b"\x1b[B\r")
-        begin = tty.expect(b"HTTPS URL (hidden): ", start=dialog)
-        tty.expect_echo_disabled()
-        tty.send(JSON_URL + b"\r")
-        result = tty.expect(RETURN_PROMPT, start=begin)
-        tty.expect_actions("import-json --url-stdin", "json-input-ok")
-        assert JSON_URL not in tty.transcript, "The HTTPS URL was echoed to the terminal"
+        dashboard = tty.expect(STOP_TUN, start=review)
         tty.send(b"\r")
-        tty.expect(TITLE, start=result)
-        tty.send(b"q")
+        review = tty.expect(RETURN_PROMPT, start=dashboard)
+        tty.expect_actions("enable-tun --auto", "stop-tun")
+        tty.send(b"\r")
+        dashboard = tty.expect(START_TUN, start=review)
+        tty.send(b"j\r")
+        tty.expect(RETURN_PROMPT, start=dashboard)
+        tty.expect_actions("enable-tun --auto", "stop-tun", "update")
+        tty.send(b"\r")
         tty.assert_exit()
 
 
@@ -254,14 +253,14 @@ def resize_case(toolbox, bash, tmp):
     with Terminal(toolbox, bash, tmp, rows=24, cols=80) as tty:
         tty.expect(VLESS_LABEL)
         before_resize = len(tty.transcript)
-        tty.resize(12, 40)
+        tty.resize(10, 40)
         after_resize = tty.expect(TITLE, start=before_resize)
-        # Eight moves from Install sing-box reach View logs, requiring scroll.
-        tty.send(b"jjjjjjj\x1bOB")
-        tty.expect(b"View logs", start=after_resize)
+        # The third item moves the selection onto the next page.
+        tty.send(b"j\x1bOB")
+        tty.expect(START_TUN, start=after_resize)
         tty.send(b"\r")
         result = tty.expect(RETURN_PROMPT, start=after_resize)
-        tty.expect_actions("logs")
+        tty.expect_actions("enable-tun --auto")
         tty.send(b"\r")
         tty.expect(TITLE, start=result)
         tty.send(b"q")
@@ -270,25 +269,25 @@ def resize_case(toolbox, bash, tmp):
 
 def output_case(toolbox, bash, tmp):
     with Terminal(toolbox, bash, tmp, rows=18, cols=88) as tty:
-        tty.expect(b"ACTIONS")
-        tty.send(b"jjjjjjjj\r")
+        tty.expect(START_TUN)
+        tty.send(b"\r")
         running = tty.expect(b"Running...")
-        tty.expect(b"First journal entry", start=running)
+        tty.expect(b"First installer line", start=running)
         review = tty.expect(RETURN_PROMPT, start=running)
-        assert b"Last journal entry" in tty.transcript[running:review]
+        assert b"Last installer line" in tty.transcript[running:review]
         assert ALT_SCREEN_EXIT not in tty.transcript, "Command output escaped the alternate screen"
         tty.send(b"\x1b[5~")
-        scrolled = tty.expect(b"First journal entry", start=review)
+        scrolled = tty.expect(b"First installer line", start=review)
         tty.send(b"\r")
-        dashboard = tty.expect(b"ACTIONS", start=scrolled)
-        tty.send(b"kkk\r")
+        dashboard = tty.expect(START_TUN, start=scrolled)
+        tty.send(b"jj\r")
         failed = tty.expect(b"Failed (exit 42)", start=dashboard)
         review = tty.expect(RETURN_PROMPT, start=failed)
         assert b"Fixture connectivity failed." in tty.transcript[failed:review]
-        assert b"journal entry" not in tty.transcript[failed:review].lower()
-        tty.expect_actions("logs", "test")
+        assert b"installer line" not in tty.transcript[failed:review].lower()
+        tty.expect_actions("install", "enable-tun --auto")
         tty.send(b"\x1b")
-        tty.expect(b"ACTIONS", start=review)
+        tty.expect(START_TUN, start=review)
         assert not list(tmp.glob("ui-output.*")), "An action output file was left behind"
         tty.send(b"q")
         tty.assert_exit()
@@ -303,8 +302,19 @@ def term_case(toolbox, bash, tmp):
 
 
 def plain_case(toolbox, bash, tmp):
+    (tmp / "allow-start").touch()
     with Terminal(toolbox, bash, tmp, term="dumb") as tty:
         tty.expect(b" 1. Install sing-box")
+        tty.expect(b" 2. Import VLESS link")
+        tty.expect(b" 3. Start TUN")
+        tty.expect(b" 4. Update toolbox")
+        menu = tty.expect(b" 0. Exit")
+        assert b" 5. " not in tty.transcript
+        tty.send(b"3\r")
+        menu = tty.expect(b" 3. Stop TUN", start=menu)
+        tty.send(b"3\r")
+        tty.expect(b" 3. Start TUN", start=menu)
+        tty.expect_actions("enable-tun --auto", "stop-tun")
         tty.send(b"0\r")
         tty.assert_exit()
         assert b"\x1b[?1049h" not in tty.transcript, "Plain fallback used the alternate screen"
@@ -327,8 +337,8 @@ def cli_case(toolbox, bash, tmp):
 def run_cases(toolbox, bash):
     for test, label in (
         (credential_case, "arrow navigation, hidden credential, and Escape exit"),
-        (json_case, "JSON source dialog, Escape back, and hidden HTTPS URL"),
-        (resize_case, "resize, short-window scrolling, and log dispatch"),
+        (toggle_case, "simplified menu, Start/Stop TUN toggle, and updater dispatch"),
+        (resize_case, "resize, short-window scrolling, and Start TUN dispatch"),
         (output_case, "live output, scrolling, fresh action results, and safe terminal rendering"),
         (term_case, "terminal restoration after SIGTERM"),
         (plain_case, "plain menu fallback on a dumb terminal"),

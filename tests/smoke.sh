@@ -328,6 +328,9 @@ transaction_fixture() {
     BIN=/test/sing-box
     FAIL_TIMER=no
     FAIL_CLEANUP=no
+    MOCK_UNIT_FRAGMENT=/usr/lib/systemd/system/sing-box.service
+    MOCK_UNIT_USER=sing-box
+    MOCK_UNIT_DROPINS=$DROP_IN
 
     boot_id() { printf 'test-boot\n'; }
     sync() { return 0; }
@@ -349,9 +352,9 @@ transaction_fixture() {
             "stop $UNIT") printf 'inactive\n' >"$TEST_CASE/service-state" ;;
             "start $UNIT") printf 'active\n' >"$TEST_CASE/service-state" ;;
             "show $UNIT --property=ActiveState --value") cat -- "$TEST_CASE/service-state" ;;
-            "show $UNIT --property=FragmentPath --value") printf '/usr/lib/systemd/system/sing-box.service\n' ;;
-            "show $UNIT --property=User --value") printf 'root\n' ;;
-            "show $UNIT --property=DropInPaths --value") printf '%s\n' "$DROP_IN" ;;
+            "show $UNIT --property=FragmentPath --value") printf '%s\n' "$MOCK_UNIT_FRAGMENT" ;;
+            "show $UNIT --property=User --value") printf '%s\n' "$MOCK_UNIT_USER" ;;
+            "show $UNIT --property=DropInPaths --value") printf '%s\n' "$MOCK_UNIT_DROPINS" ;;
             "is-active --quiet $UNIT") [[ $(<"$TEST_CASE/service-state") == active ]] ;;
             *) test_fail "unexpected systemd action $*" ;;
         esac
@@ -365,6 +368,32 @@ transaction_fixture() {
             fi
         }
     fi
+}
+
+vendor_service_compatibility() {
+    local case_dir=$1
+    transaction_fixture "$case_dir"
+    rm -f -- "$DROP_IN"
+    MOCK_UNIT_DROPINS=''
+    service_compatible || test_fail 'official sing-box service account was rejected'
+    MOCK_UNIT_FRAGMENT=/lib/systemd/system/sing-box.service
+    service_compatible || test_fail 'official service under /lib was rejected'
+    MOCK_UNIT_FRAGMENT=/etc/systemd/system/sing-box.service
+    expect_failure "$case_dir" service_compatible
+    grep -Fq 'Unsupported sing-box unit path' "$case_dir/rejection.log" || test_fail 'unit path error was unclear'
+    MOCK_UNIT_FRAGMENT=/usr/lib/systemd/system/sing-box.service
+    MOCK_UNIT_DROPINS=/etc/systemd/system/sing-box.service.d/local.conf
+    expect_failure "$case_dir" service_compatible
+    grep -Fq "$MOCK_UNIT_DROPINS" "$case_dir/rejection.log" || test_fail 'drop-in error did not name the file'
+    MOCK_UNIT_DROPINS=''
+    MOCK_UNIT_USER=other-service
+    expect_failure "$case_dir" service_compatible
+    grep -Fq 'Unsupported sing-box service account' "$case_dir/rejection.log" || test_fail 'service account error was unclear'
+    MOCK_UNIT_USER=root
+    service_compatible || test_fail 'previously supported root service account was rejected'
+    printf 'activating\n' >"$case_dir/service-state"
+    expect_failure "$case_dir" service_compatible
+    grep -Fq "'activating' state" "$case_dir/rejection.log" || test_fail 'transition error did not name the state'
 }
 
 transaction_rollback() {
@@ -490,17 +519,58 @@ successful_tun_confirmation() {
         test_fail 'confirmation did not recheck TUN health'
 }
 
+stop_preserves_external_service() {
+    local case_dir=$1
+    transaction_fixture "$case_dir"
+    rm -f -- "$DROP_IN"
+    MOCK_UNIT_DROPINS=''
+    stop_tun >"$case_dir/stop.log" 2>&1 || true
+    begin_transaction >"$case_dir/begin.log" 2>&1
+    stop_tun >>"$case_dir/stop.log" 2>&1 || true
+    [[ -e $STATE_DIR/pending && $(<"$case_dir/timer-state") == active ]] ||
+        test_fail 'Stop cleared an unrelated pending transaction'
+    atomic_text "$TXN/new-ipv6" no
+    stop_tun >>"$case_dir/stop.log" 2>&1 || test_fail 'Stop failed to cancel a TUN before configuration was applied'
+    [[ ! -e $STATE_DIR/pending && $(<"$case_dir/timer-state") == inactive ]] ||
+        test_fail 'Stop left the un-applied TUN watchdog armed'
+    [[ $(<"$case_dir/service-state") == active ]] || test_fail 'Stop interrupted an external sing-box service'
+    if grep -Fxq "stop $UNIT" "$case_dir/events"; then
+        test_fail 'Stop attempted to stop an external service'
+    fi
+}
+
+stop_pending_tun() {
+    local case_dir=$1
+    transaction_fixture "$case_dir"
+    printf '# singbox-toolbox mode=tun\n[Service]\n' >"$DROP_IN"
+    printf 'test-boot\n' >"$TUN_PERMIT"
+    begin_transaction >"$case_dir/begin.log" 2>&1
+    apply_config tun no "$case_dir/profile.json" "$case_dir/candidate.json"
+    : >"$case_dir/events"
+    require_commands() { return 0; }
+    stop_tun >"$case_dir/stop.log" 2>&1 || test_fail 'Stop failed with a pending managed TUN'
+    [[ ! -e $STATE_DIR/pending && ! -e $TUN_PERMIT ]] || test_fail 'Stop left a pending transaction or TUN permit'
+    [[ $(<"$case_dir/timer-state") == inactive && $(<"$case_dir/service-state") == inactive ]] ||
+        test_fail 'Stop left the watchdog or restored TUN running'
+    cmp -s "$CONFIG_FILE" "$case_dir/original.json" || test_fail 'Stop skipped restoring the prior configuration'
+    [[ $(grep -Fxc "stop $UNIT" "$case_dir/events") == 2 && $(grep -Fxc 'cleanup-tun' "$case_dir/events") == 2 ]] ||
+        test_fail 'Stop did not clean up both the pending and restored tunnels'
+}
+
 run_case 'VLESS TCP/TLS, Reality, WebSocket and gRPC conversion' vless_transports
 run_case 'malformed input rejected without credential disclosure' invalid_configuration
 run_case 'TUN exclusions and loopback-only proxy listener' tun_configuration
 run_case 'official package metadata, digest, backup and repeat install' installer_idempotence
 run_case 'digest mismatch rejects the package without changing active config' installer_bad_digest
 run_case 'failed package installation restores the original conffile' installer_failed_package
+run_case 'official sing-box unit accepted and unsupported unit settings rejected' vendor_service_compatibility
 run_case 'SSH route verification and second-session enforcement' ssh_protection
 run_case 'persistent rollback snapshot, failed restoration, retry and idempotence' transaction_rollback
 run_case 'failed timer arming leaves the prior configuration and service running' transaction_timer_failure
 run_case 'failed live connectivity automatically restores the working proxy' failed_live_connection
 run_case 'healthy TUN stays pending until health is rechecked from a second session' successful_tun_confirmation
+run_case 'TUN Stop preserves an external sing-box service' stop_preserves_external_service
+run_case 'TUN Stop rolls back pending activation and stops a restored managed tunnel' stop_pending_tun
 if [[ -n $TOOLBOX_TEST_BINARY ]]; then
     printf 'Generated configs also passed the real sing-box configuration checker.\n'
 else
