@@ -53,7 +53,8 @@ ubuntu_release() {
 runtime_init() {
     local action=$1
     ((EUID == 0)) || { fail 'Run the toolbox as root (sudo).'; return 1; }
-    ((BASH_VERSINFO[0] >= 4)) || { fail 'Bash 4 or newer is required.'; return 1; }
+    ((BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3))) ||
+        { fail 'Bash 4.3 or newer is required.'; return 1; }
     require_commands systemctl flock install mktemp stat sync mv rm date timeout realpath grep || return 1
     [[ -d /run/systemd/system ]] || { fail 'An active systemd system manager is required.'; return 1; }
     if [[ $action != _rollback ]] && ! ubuntu_release >/dev/null; then
@@ -2029,7 +2030,8 @@ Usage: sudo bash singbox-toolbox.sh [COMMAND]
   uninstall --yes          Remove the Debian package and retain config and backups
   help                     Show this help
 
-Run without a command for the interactive menu. Use sudo
+Run without a command for the keyboard-driven terminal interface.
+Use menu --plain for a numbered menu. Use sudo
 --preserve-env=SSH_CONNECTION for enable-tun, confirm, and TUN restart/restore.
 EOF
 }
@@ -2072,75 +2074,415 @@ run_action() {
     return "$result"
 }
 
-menu() {
-    local selection input source
+TUI_ACTIVE=no
+TUI_RESIZED=no
+TUI_CHOICE=0
+TUI_STATE=
+TUI_MODE=
+TUI_PROFILE=
+TUI_PENDING=no
+TUI_DEADLINE=
+TUI_WIDTH=76
+TUI_HEIGHT=24
+TUI_ACCENT=
+TUI_MUTED=
+TUI_FOCUS=$'\033[7m'
+
+tui_cleanup() {
+    if [[ $TUI_ACTIVE == yes ]]; then
+        TUI_ACTIVE=no
+        printf '\033[0m\033[?25h\033[?1049l' || true
+    fi
+}
+
+tui_open() {
+    if [[ $TUI_ACTIVE != yes ]]; then
+        TUI_ACTIVE=yes
+        printf '\033[?1049h'
+    fi
+    printf '\033[?25l'
+}
+
+tui_measure() {
+    local dimensions rows cols
+    dimensions=$(stty size 2>/dev/null) || dimensions=
+    IFS=' ' read -r rows cols <<<"$dimensions"
+    [[ $rows =~ ^[1-9][0-9]{0,3}$ ]] || rows=24
+    [[ $cols =~ ^[1-9][0-9]{0,3}$ ]] || cols=80
+    TUI_HEIGHT=$rows
+    TUI_WIDTH=$((cols > 4 ? cols - 4 : 1))
+    if ((TUI_WIDTH > 88)); then
+        TUI_WIDTH=88
+    fi
+}
+
+tui_line() {
+    local row=$1 content=$2 style=${3:-}
+    printf '\033[%d;1H\033[2K  %s%-*.*s\033[0m' \
+        "$row" "$style" "$TUI_WIDTH" "$TUI_WIDTH" "$content"
+}
+
+tui_refresh() {
+    local service_state='' snapshot
+    TUI_STATE='Not installed'
+    if type -P sing-box >/dev/null; then
+        service_state=$(timeout 2s systemctl show "$UNIT" --property=ActiveState --value 2>/dev/null) || service_state=
+        case $service_state in
+            active) TUI_STATE=Running ;;
+            inactive) TUI_STATE=Stopped ;;
+            failed) TUI_STATE=Failed ;;
+            activating|deactivating|reloading) TUI_STATE='Changing state' ;;
+            *) TUI_STATE=Unknown ;;
+        esac
+    fi
+    TUI_MODE=$(managed_mode 2>/dev/null) || TUI_MODE=unknown
+    case $TUI_MODE in
+        proxy) TUI_MODE=Proxy ;;
+        tun) TUI_MODE=TUN ;;
+        external) TUI_MODE='Unmanaged' ;;
+        *) TUI_MODE='Unknown' ;;
+    esac
+    TUI_PROFILE=None
+    if [[ -s $STATE_DIR/profile.json ]]; then
+        TUI_PROFILE=Staged
+    fi
+    TUI_PENDING=no
+    TUI_DEADLINE=
+    if [[ -e $STATE_DIR/pending ]]; then
+        TUI_PENDING=yes
+        if snapshot=$(read_pointer pending 2>/dev/null) && [[ -r $snapshot/deadline ]]; then
+            IFS= read -r TUI_DEADLINE <"$snapshot/deadline" || TUI_DEADLINE=
+        fi
+    fi
+}
+
+tui_status_line() {
+    local remaining now
+    if [[ $TUI_PENDING != yes ]]; then
+        printf 'Profile  %s' "$TUI_PROFILE"
+        return
+    fi
+    if [[ $TUI_DEADLINE =~ ^[1-9][0-9]{8,9}$ ]]; then
+        printf -v now '%(%s)T' -1
+        remaining=$((TUI_DEADLINE - now))
+        if ((remaining > 0)); then
+            printf 'Rollback in %02d:%02d  |  Confirm from a fresh SSH session' "$((remaining / 60))" "$((remaining % 60))"
+            return
+        fi
+    fi
+    printf '%s' 'Rollback pending  |  Check service status'
+}
+
+tui_render() {
+    local title=$1 focus=$2 subtitle=$3
+    local -n render_labels=$4 render_details=$5
+    local count=${#render_labels[@]} first visible index row footer rule prefix
+    tui_measure
+    printf '\033[H\033[J'
+    tui_line 1 'UBUNTU VLESS' "$TUI_ACCENT"
+    if ((TUI_HEIGHT < 10)); then
+        if ((TUI_HEIGHT >= 2)); then
+            tui_line 2 "> ${render_labels[focus]}" "$TUI_FOCUS"
+        fi
+        if ((TUI_HEIGHT >= 3)); then
+            tui_line 3 'Up/Down  Enter  Esc' "$TUI_MUTED"
+        fi
+        return
+    fi
+    if [[ -n $subtitle ]]; then
+        tui_line 2 "$subtitle" "$TUI_MUTED"
+    else
+        tui_line 2 "Service  $TUI_STATE  |  Route  $TUI_MODE"
+    fi
+    if [[ -z $subtitle || $TUI_PENDING == yes ]]; then
+        tui_line 3 "$(tui_status_line)" "$TUI_ACCENT"
+    fi
+    printf -v rule '%*s' "$TUI_WIDTH" ''
+    tui_line 4 "${rule// /-}" "$TUI_MUTED"
+    visible=$((TUI_HEIGHT - 8))
+    first=$((focus / visible * visible))
+    tui_line 5 "$title" "$TUI_ACCENT"
+    for ((index = first; index < first + visible && index < count; index++)); do
+        row=$((6 + index - first))
+        if ((index == focus)); then
+            prefix=' > '
+            tui_line "$row" "$prefix${render_labels[index]}" "$TUI_FOCUS"
+        else
+            tui_line "$row" "   ${render_labels[index]}"
+        fi
+    done
+    tui_line "$((TUI_HEIGHT - 2))" "${render_details[focus]}" "$TUI_MUTED"
+    if ((TUI_WIDTH >= 55)); then
+        footer='Up/Down Move   Enter Select   R Refresh   Esc Back'
+        if ((count > visible)); then
+            footer+="   $((focus + 1))/$count"
+        fi
+    else
+        footer='Up/Down  Enter  Esc'
+    fi
+    tui_line "$((TUI_HEIGHT - 1))" "$footer" "$TUI_MUTED"
+}
+
+tui_key() {
+    local input='' escaped='' ending='' result=0
+    IFS= read -rsn1 -t 1 input || result=$?
+    if ((result > 128)); then
+        TUI_KEY=idle
+        return
+    elif ((result != 0)); then
+        TUI_KEY=eof
+        return
+    fi
+    case $input in
+        '')
+            TUI_KEY=enter ;;
+        k|K)
+            TUI_KEY=up ;;
+        j|J|$'\t')
+            TUI_KEY=down ;;
+        q|Q)
+            TUI_KEY=back ;;
+        r|R)
+            TUI_KEY=refresh ;;
+        $'\033')
+            if ! IFS= read -rsn1 -t .18 escaped; then
+                TUI_KEY=back
+                return
+            fi
+            TUI_KEY=ignore
+            if [[ $escaped == '[' || $escaped == O ]] && IFS= read -rsn1 -t .18 ending; then
+                case $ending in
+                    A) TUI_KEY=up ;;
+                    B) TUI_KEY=down ;;
+                    H) TUI_KEY=first ;;
+                    F) TUI_KEY=last ;;
+                esac
+            fi ;;
+        *)
+            TUI_KEY=ignore ;;
+    esac
+}
+
+tui_select() {
+    local title=$1 subtitle=$2 list_name=$3 details_name=$4 focus=${5:-0} dirty=yes
+    local -n choices=$list_name
+    local count=${#choices[@]}
+    tui_open
     while true; do
-        printf '\n%s\n' 'sing-box toolbox' \
-            ' 1. Install sing-box' ' 2. Import VLESS URL' ' 3. Import JSON configuration' \
-            ' 4. Enable SOCKS5 proxy' ' 5. Enable full-server TUN routing' \
-            ' 6. Test proxy connection' ' 7. Show current public IP' \
-            ' 8. Check sing-box status' ' 9. View logs' '10. Restart sing-box' \
-            '11. Stop sing-box' '12. Restore previous configuration' '13. Uninstall sing-box' ' 0. Exit'
-        read -r -p '> ' selection || return 0
-        case $selection in
-            1) run_action install || true ;;
-            2)
-                IFS= read -rs -p 'VLESS URL (hidden): ' input || return 0
-                printf '\n'
-                run_action import-vless - <<<"$input" || true
-                unset input
-                ;;
-            3)
-                read -r -p 'Import [f]ile or [u]rl? ' source || return 0
-                case $source in
-                    f)
-                        IFS= read -r -p 'Local JSON path: ' input || return 0
-                        run_action import-json "$input" || true
-                        ;;
-                    u)
-                        IFS= read -rs -p 'HTTPS URL (hidden): ' input || return 0
-                        printf '\n'
-                        run_action import-json --url-stdin <<<"$input" || true
-                        unset input
-                        ;;
-                    *) log_warn 'Enter f or u.' ;;
-                esac ;;
-            4) run_action enable-proxy || true ;;
-            5)
-                read -r -p 'Tunnel IPv6 as well? [y/N] ' input || return 0
-                if [[ $input == [yY] ]]; then
-                    run_action enable-tun --ipv6 || true
-                else
-                    run_action enable-tun || true
+        if [[ $dirty == yes || $TUI_RESIZED == yes ]]; then
+            TUI_RESIZED=no
+            tui_render "$title" "$focus" "$subtitle" "$list_name" "$details_name"
+        fi
+        dirty=yes
+        tui_key
+        case $TUI_KEY in
+            up) focus=$(((focus + count - 1) % count)) ;;
+            down) focus=$(((focus + 1) % count)) ;;
+            first) focus=0 ;;
+            last) focus=$((count - 1)) ;;
+            enter) TUI_CHOICE=$focus; return 0 ;;
+            back|eof) return 1 ;;
+            refresh) tui_refresh ;;
+            idle)
+                if [[ $TUI_PENDING == yes && ! -e $STATE_DIR/pending ]] ||
+                   [[ $TUI_PENDING == no && -e $STATE_DIR/pending ]]; then
+                    tui_refresh
+                elif [[ $TUI_PENDING == no ]]; then
+                    dirty=no
                 fi ;;
-            6) run_action test || true ;;
-            7) run_action ip || true ;;
-            8) run_action status || true ;;
-            9) run_action logs || true ;;
-            10) run_action restart || true ;;
-            11) run_action stop || true ;;
-            12)
-                if [[ -e $STATE_DIR/pending ]]; then
-                    run_action rollback || true
-                else
-                    run_action restore || true
-                fi ;;
-            13)
-                read -r -p 'Type UNINSTALL to remove the Debian package: ' input || return 0
-                if [[ $input == UNINSTALL ]]; then
-                    run_action uninstall --yes || true
-                fi ;;
-            0) return 0 ;;
-            *) log_warn 'Choose a number from the menu.' ;;
+            *) dirty=no ;;
         esac
     done
+}
+
+tui_prompt() {
+    local title=$1 instructions=$2
+    printf '\033[H\033[J\033[?25h'
+    tui_measure
+    tui_line 1 'UBUNTU VLESS' "$TUI_ACCENT"
+    tui_line 3 "$title" "$TUI_ACCENT"
+    tui_line 4 "$instructions"
+    printf '\033[6;1H  '
+}
+
+menu_run() {
+    local ui=$1 title=$2 action=$3 result=0
+    shift 3
+    if [[ $ui == terminal ]]; then
+        tui_cleanup
+        printf '\n%s\n\n' "$title"
+    fi
+    if [[ $action == import-vless || ( $action == import-json && ${1:-} == --url-stdin ) ]]; then
+        run_action "$action" "$@" <&3 3<&- || result=$?
+    else
+        run_action "$action" "$@" || result=$?
+    fi
+    if [[ $ui == terminal ]]; then
+        if ((result != 0)); then
+            printf '\n%s\n' 'Action failed. See the output above.'
+        fi
+        printf '\n%s' 'Press Enter to return to the toolbox.'
+        IFS= read -r || return 1
+    fi
+}
+
+menu_action() {
+    local ui=$1 action=$2 title=$3 input source
+    local -a dialog_labels dialog_details
+    # The dialog arrays are used through tui_select/tui_render namerefs.
+    # shellcheck disable=SC2034
+    case $action in
+        import-vless)
+            if [[ $ui == terminal ]]; then
+                tui_prompt "$title" 'Paste one VLESS link. Empty input goes back.'
+            fi
+            IFS= read -rs -p 'VLESS URL (hidden): ' input || return 1
+            printf '\n'
+            if [[ -n $input ]]; then
+                # Only the action gets the here-string. The return prompt still reads the SSH terminal.
+                menu_run "$ui" "$title" import-vless - 3<<<"$input" || return 1
+            fi ;;
+        import-json)
+            if [[ $ui == terminal ]]; then
+                dialog_labels=('Local JSON file' 'HTTPS URL' 'Back')
+                dialog_details=('Read a file already on this Ubuntu server.' 'Paste the final HTTPS URL with input hidden.' 'Return to the action list.')
+                tui_select "$title" 'Choose a source for the client profile.' dialog_labels dialog_details || return 0
+                case $TUI_CHOICE in 0) source=f ;; 1) source=u ;; *) return 0 ;; esac
+            else
+                IFS= read -r -p 'Import [f]ile or [u]rl? ' source || return 1
+            fi
+            case $source in
+                f)
+                    if [[ $ui == terminal ]]; then
+                        tui_prompt "$title" 'Enter a path on this server. Empty input goes back.'
+                    fi
+                    IFS= read -r -p 'Local JSON path: ' input || return 1
+                    if [[ -n $input ]]; then
+                        menu_run "$ui" "$title" import-json "$input" || return 1
+                    fi ;;
+                u)
+                    if [[ $ui == terminal ]]; then
+                        tui_prompt "$title" 'Paste the full HTTPS URL. Empty input goes back.'
+                    fi
+                    IFS= read -rs -p 'HTTPS URL (hidden): ' input || return 1
+                    printf '\n'
+                    if [[ -n $input ]]; then
+                        menu_run "$ui" "$title" import-json --url-stdin 3<<<"$input" || return 1
+                    fi ;;
+                *) log_warn 'Enter f or u.' ;;
+            esac ;;
+        enable-tun)
+            if [[ $ui == terminal ]]; then
+                dialog_labels=('IPv4' 'IPv4 and IPv6' 'Back')
+                dialog_details=('Use on a server without a public IPv6 route.' 'Tunnel both families through a dual-stack upstream.' 'Return without changing routing.')
+                tui_select "$title" 'Keep this SSH session open. Rollback stays armed for five minutes.' dialog_labels dialog_details 2 || return 0
+                case $TUI_CHOICE in 0) input=n ;; 1) input=y ;; *) return 0 ;; esac
+            else
+                IFS= read -r -p 'Tunnel IPv6 as well? [y/N] ' input || return 1
+            fi
+            if [[ $input == [yY] ]]; then
+                menu_run "$ui" "$title" enable-tun --ipv6 || return 1
+            else
+                menu_run "$ui" "$title" enable-tun || return 1
+            fi ;;
+        restore)
+            if [[ -e $STATE_DIR/pending ]]; then
+                menu_run "$ui" 'Roll back pending change' rollback || return 1
+            else
+                menu_run "$ui" "$title" restore || return 1
+            fi ;;
+        uninstall)
+            if [[ $ui == terminal ]]; then
+                tui_prompt "$title" 'The package is removed. Configuration and backups stay on disk.'
+            fi
+            IFS= read -r -p 'Type UNINSTALL to continue: ' input || return 1
+            if [[ $input == UNINSTALL ]]; then
+                menu_run "$ui" "$title" uninstall --yes || return 1
+            fi ;;
+        *)
+            menu_run "$ui" "$title" "$action" || return 1 ;;
+    esac
+}
+
+menu() {
+    local ui=terminal focus=0 selection index title
+    local -a actions=(install import-vless import-json enable-proxy enable-tun test ip status logs restart stop restore uninstall confirm exit)
+    local -a labels=(
+        'Install sing-box' 'Import VLESS link' 'Import JSON profile'
+        'Enable loopback proxy' 'Enable full-server TUN' 'Test proxy connection' 'Show public IP'
+        'Service status' 'View logs' 'Restart sing-box' 'Stop sing-box'
+        'Restore previous configuration' 'Uninstall sing-box' 'Confirm TUN' 'Exit'
+    )
+    # Read by tui_render through a nameref.
+    # shellcheck disable=SC2034
+    local -a details=(
+        'Install the stable package or check the version already installed.'
+        'Stage a VLESS link without echoing it to the terminal.'
+        'Stage a profile from a local file or HTTPS.'
+        'Start SOCKS5 and HTTP on 127.0.0.1:1080 and test the connection.'
+        'Route server traffic through sing-box with an SSH rollback timer.'
+        'Check the running proxy and display its public egress.'
+        'Check the public IPv4 address used by this server.'
+        'Show the daemon state and any pending rollback deadline.'
+        'Read recent systemd events with credentials withheld.'
+        'Restart the managed service and rerun its connection checks.'
+        'Stop sing-box and remove its managed TUN routes.'
+        'Restore the last snapshot or roll back a pending change now.'
+        'Remove the Debian package while retaining your configuration.'
+        'Confirm from the new SSH session after TUN health checks pass.'
+        'Close this terminal interface.'
+    )
+    if [[ ${1:-} == --plain || ! -t 1 || ${TERM:-dumb} == dumb || ${TERM:-} == unknown || ${TERM:-} == linux ]]; then
+        ui=plain
+    fi
+    if [[ $ui == terminal ]]; then
+        if [[ ! ${NO_COLOR+x} ]]; then
+            TUI_ACCENT=$'\033[1;36m'
+            TUI_MUTED=$'\033[2m'
+        fi
+        trap 'TUI_RESIZED=yes' WINCH
+        tui_refresh
+    fi
+    while true; do
+        if [[ $ui == terminal ]]; then
+            if [[ $TUI_PENDING == yes ]]; then
+                labels[11]='Roll back pending change'
+            else
+                labels[11]='Restore previous configuration'
+            fi
+            if ! tui_select 'ACTIONS' '' labels details "$focus"; then
+                break
+            fi
+            focus=$TUI_CHOICE
+        else
+            printf '\n%s\n' 'Ubuntu VLESS'
+            for ((index = 0; index < ${#actions[@]} - 1; index++)); do
+                printf '%2d. %s\n' "$((index + 1))" "${labels[index]}"
+            done
+            printf '%s\n' ' 0. Exit'
+            IFS= read -r -p '> ' selection || break
+            case $selection in
+                0) break ;;
+                [1-9]|1[0-4]) focus=$((selection - 1)) ;;
+                *) log_warn 'Choose a number from the menu.'; continue ;;
+            esac
+        fi
+        [[ ${actions[focus]} != exit ]] || break
+        title=${labels[focus]}
+        menu_action "$ui" "${actions[focus]}" "$title" || break
+        if [[ $ui == terminal ]]; then
+            tui_refresh
+        fi
+    done
+    tui_cleanup
 }
 
 main() {
     local action=${1:-menu}
     case $action in
         help|-h|--help) usage; return 0 ;;
-        menu|install|enable-proxy|confirm|test|ip|status|logs|restart|stop|restore|rollback|_rollback)
+        menu) [[ $# -le 1 || ( $# == 2 && $2 == --plain ) ]] || { usage >&2; return 2; } ;;
+        install|enable-proxy|confirm|test|ip|status|logs|restart|stop|restore|rollback|_rollback)
             (($# <= 1)) || { usage >&2; return 2; } ;;
         import-vless|import-json) (($# == 2)) || { usage >&2; return 2; } ;;
         enable-tun) [[ $# == 1 || ( $# == 2 && $2 == --ipv6 ) ]] || { usage >&2; return 2; } ;;
@@ -2150,14 +2492,14 @@ main() {
     export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     export LC_ALL=C SYSTEMD_COLORS=0 SYSTEMD_PAGER=cat
     trap 'log_error "Unexpected toolbox failure near line $LINENO."' ERR
-    trap scratch_close EXIT
+    trap 'tui_cleanup; scratch_close' EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
     runtime_init "$action" || return 1
     if [[ $action == menu ]]; then
         [[ -t 0 ]] || { usage >&2; return 2; }
-        menu
+        menu "${2:-}"
     else
         shift
         run_action "$action" "$@"
