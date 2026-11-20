@@ -2666,14 +2666,15 @@ tui_has_running_tun() {
 
 menu() {
     local ui=terminal focus=0 selection index title
-    local -a actions=(install import-vless enable-tun update)
-    local -a labels=('Install sing-box' 'Import VLESS link' 'Start TUN' 'Update toolbox')
+    local -a actions=(install import-vless enable-tun enable-proxy update)
+    local -a labels=('Install sing-box' 'Import VLESS link' 'Start TUN' 'Enable proxy' 'Update toolbox')
     # Read by tui_render through a nameref.
     # shellcheck disable=SC2034
     local -a details=(
         'Install sing-box or check the version already installed.'
         'Import one VLESS link with the input hidden.'
         'Start the tunnel and confirm from a new SSH session.'
+        'Use the imported profile through a SOCKS5/HTTP proxy on 127.0.0.1:1080.'
         'Fetch the latest toolbox from GitHub.'
     )
     if [[ ${1:-} == --plain || ! -t 1 || ${TERM:-dumb} == dumb || ${TERM:-} == unknown || ${TERM:-} == linux ]]; then
@@ -2717,7 +2718,7 @@ menu() {
             IFS= read -r -p '> ' selection || break
             case $selection in
                 0) break ;;
-                [1-4]) focus=$((selection - 1)) ;;
+                [1-5]) focus=$((selection - 1)) ;;
                 *) log_warn 'Choose a number from the menu.'; continue ;;
             esac
         fi

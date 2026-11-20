@@ -205,6 +205,7 @@ RETURN_PROMPT = b"Enter/Esc Back"
 ALT_SCREEN_EXIT = b"\x1b[?1049l"
 START_TUN = b"Start TUN"
 STOP_TUN = b"Stop TUN"
+ENABLE_PROXY = b"Enable proxy"
 
 
 def credential_case(toolbox, bash, tmp):
@@ -229,8 +230,9 @@ def toggle_case(toolbox, bash, tmp):
     (tmp / "allow-start").touch()
     with Terminal(toolbox, bash, tmp) as tty:
         tty.expect(START_TUN)
+        tty.expect(ENABLE_PROXY)
         dashboard = tty.expect(b"Update toolbox")
-        for removed in (b"Import JSON profile", b"View logs", b"Service status", b"Enable loopback proxy"):
+        for removed in (b"Import JSON profile", b"View logs", b"Service status"):
             assert removed not in tty.transcript
         tty.send(b"jj\r")
         review = tty.expect(RETURN_PROMPT, start=dashboard)
@@ -243,8 +245,13 @@ def toggle_case(toolbox, bash, tmp):
         tty.send(b"\r")
         dashboard = tty.expect(START_TUN, start=review)
         tty.send(b"j\r")
+        review = tty.expect(RETURN_PROMPT, start=dashboard)
+        tty.expect_actions("enable-tun --auto", "stop-tun", "enable-proxy")
+        tty.send(b"\r")
+        dashboard = tty.expect(ENABLE_PROXY, start=review)
+        tty.send(b"j\r")
         tty.expect(RETURN_PROMPT, start=dashboard)
-        tty.expect_actions("enable-tun --auto", "stop-tun", "update")
+        tty.expect_actions("enable-tun --auto", "stop-tun", "enable-proxy", "update")
         tty.send(b"\r")
         tty.assert_exit()
 
@@ -307,14 +314,17 @@ def plain_case(toolbox, bash, tmp):
         tty.expect(b" 1. Install sing-box")
         tty.expect(b" 2. Import VLESS link")
         tty.expect(b" 3. Start TUN")
-        tty.expect(b" 4. Update toolbox")
+        tty.expect(b" 4. Enable proxy")
+        tty.expect(b" 5. Update toolbox")
         menu = tty.expect(b" 0. Exit")
-        assert b" 5. " not in tty.transcript
+        assert b" 6. " not in tty.transcript
         tty.send(b"3\r")
         menu = tty.expect(b" 3. Stop TUN", start=menu)
         tty.send(b"3\r")
+        menu = tty.expect(b" 3. Start TUN", start=menu)
+        tty.send(b"4\r")
         tty.expect(b" 3. Start TUN", start=menu)
-        tty.expect_actions("enable-tun --auto", "stop-tun")
+        tty.expect_actions("enable-tun --auto", "stop-tun", "enable-proxy")
         tty.send(b"0\r")
         tty.assert_exit()
         assert b"\x1b[?1049h" not in tty.transcript, "Plain fallback used the alternate screen"
@@ -337,7 +347,7 @@ def cli_case(toolbox, bash, tmp):
 def run_cases(toolbox, bash):
     for test, label in (
         (credential_case, "arrow navigation, hidden credential, and Escape exit"),
-        (toggle_case, "simplified menu, Start/Stop TUN toggle, and updater dispatch"),
+        (toggle_case, "Start/Stop TUN, Enable proxy, and Update toolbox dispatch"),
         (resize_case, "resize, short-window scrolling, and Start TUN dispatch"),
         (output_case, "live output, scrolling, fresh action results, and safe terminal rendering"),
         (term_case, "terminal restoration after SIGTERM"),
